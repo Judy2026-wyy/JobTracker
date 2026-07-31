@@ -8,3 +8,14 @@ backgroundColor = "#0d0d0d"
 secondaryBackgroundColor = "#1a1a19"
 textColor = "#ffffff"
 font = "sans serif"
+
+# toolbarMode = "viewer" 隐藏右上角菜单里的 Rerun / Clear cache / Settings
+# 等开发者选项，同时关闭它们绑定的键盘快捷键（Streamlit 默认把单独按 "c" 键
+# 绑定为"清除缓存"）。本应用页面里没有任何输入框在拿到焦点前，用户用
+# Ctrl+C 复制文字时浏览器会把 "c" 这个按键也传给页面，之前会意外弹出
+# "清除缓存"确认框；隐藏该功能后就不会再触发。
+# 补充说明：本应用没有使用 st.cache_data / st.cache_resource，所有数据都在
+# job_tracker.db 这个 SQLite 文件里，即使清除缓存也不会丢失任何已保存的
+# 投递/面试记录——只是保险起见还是把入口关掉，避免误触。
+[client]
+toolbarMode = "viewer"

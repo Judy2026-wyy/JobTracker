@@ -7,6 +7,7 @@ ui_applications.py
 - 状态流转（下拉框仅展示合法的下一状态，防止非法跳转）
 - 手动添加面试安排（含时区确认勾选）
 - 删除记录
+- 用大模型按当前分类体系批量重新归类历史记录（预览-确认后再写库）
 """
 
 from datetime import date, datetime, time
@@ -14,6 +15,7 @@ from datetime import date, datetime, time
 import streamlit as st
 
 import db
+from category_classifier import classify_positions
 from config import STATUS_FLOW, SOURCES, CATEGORIES, get_valid_next_statuses
 from timezone_utils import to_utc_iso as _to_utc_iso
 from ui_filters import render_filters
@@ -175,8 +177,110 @@ def render_applications_table():
                 st.rerun()
 
 
+def _needs_reclassify(category: str) -> bool:
+    """判断这条记录是否"没归好类"：旧分类体系的遗留值，或兜底的「其他」。"""
+    return category not in CATEGORIES or category == "其他"
+
+
+def render_reclassify():
+    """用大模型按当前分类体系重新判定历史记录的岗位分类（预览-确认后再写库）。"""
+    with st.expander("🔄 用当前分类体系重新归类历史记录", expanded=False):
+        st.caption(
+            "岗位分类体系升级后，老记录可能还留着旧类目或被归成了「其他」。"
+            "这里会把公司名+岗位名+备注交给大模型重新判定，**预览确认后**才写入数据库。"
+        )
+
+        all_apps = db.list_applications()
+        if all_apps.empty:
+            st.info("还没有投递记录，先添加几条再来吧～")
+            return
+
+        pending = all_apps[all_apps["category"].apply(_needs_reclassify)]
+        scope = st.radio(
+            "处理范围",
+            [f"只处理没归好类的（{len(pending)} 条）", f"全部记录（{len(all_apps)} 条）"],
+            key="reclassify_scope",
+            horizontal=True,
+        )
+        target = all_apps if scope.startswith("全部") else pending
+
+        if target.empty:
+            st.success("这些记录都已经归好类啦，不需要重新处理 🎉")
+            return
+
+        st.caption(f"将调用大模型处理 {len(target)} 条记录（一次请求批量处理，不会逐条调用）")
+
+        if st.button("🚀 开始重新归类", key="btn_start_reclassify"):
+            items = [
+                {
+                    "id": int(row.id),
+                    "company": row.company,
+                    "position": row.position,
+                    "notes": row.notes or "",
+                }
+                for row in target.itertuples()
+            ]
+            with st.spinner(f"正在调用大模型判定 {len(items)} 条记录的分类..."):
+                try:
+                    result = classify_positions(items)
+                    st.session_state["reclassify_result"] = result
+                    st.session_state["reclassify_items"] = items
+                    missing = len(items) - len(result)
+                    if missing:
+                        st.warning(f"有 {missing} 条模型没给出结果，这几条会保持原样不动")
+                except Exception as e:
+                    st.error(f"重新归类失败了：{e}")
+                    st.session_state.pop("reclassify_result", None)
+
+        result = st.session_state.get("reclassify_result")
+        items = st.session_state.get("reclassify_items")
+        if not result or not items:
+            return
+
+        old_by_id = {int(row.id): row.category for row in all_apps.itertuples()}
+        changes = [
+            {
+                "id": item["id"],
+                "公司": item["company"],
+                "岗位": item["position"],
+                "原分类": old_by_id.get(item["id"], ""),
+                "建议分类": result[item["id"]],
+            }
+            for item in items
+            if item["id"] in result and result[item["id"]] != old_by_id.get(item["id"])
+        ]
+
+        if not changes:
+            st.success("模型判定的结果和现有分类一致，没有需要修改的记录 👍")
+            return
+
+        st.markdown(f"**模型建议修改以下 {len(changes)} 条，取消勾选即可跳过：**")
+        keep = []
+        for change in changes:
+            checked = st.checkbox(
+                f"#{change['id']} {change['公司']} · {change['岗位']} ："
+                f"{change['原分类']} → **{change['建议分类']}**",
+                value=True,
+                key=f"reclassify_keep_{change['id']}",
+            )
+            keep.append(checked)
+
+        if st.button("✅ 应用勾选的修改", key="btn_apply_reclassify"):
+            applied = 0
+            for change, checked in zip(changes, keep):
+                if not checked:
+                    continue
+                db.update_application_fields(change["id"], category=change["建议分类"])
+                applied += 1
+            st.success(f"更新好啦，共修改了 {applied} 条记录的分类～")
+            st.session_state.pop("reclassify_result", None)
+            st.session_state.pop("reclassify_items", None)
+            st.rerun()
+
+
 def render_applications_page():
     render_applications_table()
+    render_reclassify()
     st.divider()
     tab1, tab2, tab3 = st.tabs(["手动新增", "状态流转", "添加面试安排"])
     with tab1:

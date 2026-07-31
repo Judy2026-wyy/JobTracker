@@ -15,7 +15,15 @@ from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 
-from config import DB_PATH, STATUS_FLOW, TERMINAL_STATUSES, DEFAULT_CATEGORY, get_valid_next_statuses
+from config import (
+    CATEGORIES,
+    DB_PATH,
+    DEFAULT_CATEGORY,
+    LEGACY_MAPPING,
+    STATUS_FLOW,
+    TERMINAL_STATUSES,
+    get_valid_next_statuses,
+)
 
 
 def get_connection() -> sqlite3.Connection:
@@ -68,6 +76,7 @@ def init_db() -> None:
         )
         conn.commit()
         _ensure_category_column(conn)
+        _migrate_legacy_categories(conn)
         _backfill_status_history(conn)
         conn.commit()
     finally:
@@ -82,6 +91,43 @@ def _ensure_category_column(conn: sqlite3.Connection) -> None:
         conn.execute(
             f"ALTER TABLE applications ADD COLUMN category TEXT NOT NULL DEFAULT '{DEFAULT_CATEGORY}';"
         )
+
+
+def _migrate_legacy_categories(conn: sqlite3.Connection) -> int:
+    """把旧岗位分类体系的历史数据回填成新体系的类目名。可重复执行。
+
+    只迁移 LEGACY_MAPPING 里有明确一对一对应关系的旧值；像「开发」「算法/AI」
+    这类一对多拆分的旧值（映射为 None）保持原样不动——自动猜一个新类目大概率
+    是错的，宁可留着让用户自己改或重新识别一次。这些没迁移的值仍会出现在
+    筛选器里（见 ui_filters.render_filters），不会因为不在 CATEGORIES 里就
+    被静默过滤掉。
+
+    返回实际被改写的记录数，便于测试与排查。
+    """
+    changed = 0
+    for old_value, new_value in LEGACY_MAPPING.items():
+        if not new_value or new_value == old_value or new_value not in CATEGORIES:
+            continue
+        cur = conn.execute(
+            "UPDATE applications SET category=? WHERE category=?;", (new_value, old_value)
+        )
+        changed += cur.rowcount
+    return changed
+
+
+def get_distinct_categories() -> list[str]:
+    """数据库里实际出现过的岗位分类值（含尚未迁移的旧值）。
+
+    供筛选器把这些旧值也列进选项，避免"选了全部分类反而漏掉几条老记录"。
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT category FROM applications WHERE category IS NOT NULL AND category != '';"
+        ).fetchall()
+        return [row["category"] for row in rows]
+    finally:
+        conn.close()
 
 
 def _backfill_status_history(conn: sqlite3.Connection) -> None:
@@ -425,6 +471,26 @@ def get_status_counts() -> pd.DataFrame:
             "SELECT status, COUNT(*) AS count FROM applications GROUP BY status;", conn
         )
         return df
+    finally:
+        conn.close()
+
+
+def get_daily_application_counts(start_date: str = None) -> pd.DataFrame:
+    """按投递日期分组统计每天的投递数量，供首页投递趋势折线图使用。
+
+    start_date: 只统计该日期（含）之后的记录；None 表示不限制，返回全部历史。
+    返回列：applied_date（YYYY-MM-DD）、count。日期没有投递的不会补 0 行，
+    由调用方按需重建连续日期轴。
+    """
+    conn = get_connection()
+    try:
+        query = "SELECT date(applied_date) AS applied_date, COUNT(*) AS count FROM applications"
+        params = []
+        if start_date:
+            query += " WHERE date(applied_date) >= date(?)"
+            params.append(start_date)
+        query += " GROUP BY date(applied_date) ORDER BY date(applied_date);"
+        return pd.read_sql(query, conn, params=params)
     finally:
         conn.close()
 

@@ -23,7 +23,14 @@ from datetime import datetime, timedelta
 from email.header import decode_header
 from email.utils import parsedate_to_datetime
 
-from config import ALL_STATUSES, CATEGORIES, DEFAULT_SOURCE_TIMEZONE, normalize_category, normalize_status
+from config import (
+    ALL_STATUSES,
+    DEFAULT_SOURCE_TIMEZONE,
+    build_category_prompt_block,
+    classify_email_type,
+    normalize_category,
+    normalize_status,
+)
 from timezone_utils import to_utc_iso
 
 try:
@@ -40,8 +47,7 @@ PARSE_SYSTEM_PROMPT = f"""你是求职邮件信息抽取助手。用户会给你
 - is_job_related: true/false，判断该邮件是否与求职投递/面试相关
 - company: 公司名称，识别不到填 ""
 - position: 岗位名称，识别不到填 ""
-- category: 岗位所属分类，必须从以下枚举中选择一个最匹配的值：{CATEGORIES}；
-  无法判断则填 "其他"
+- category: 岗位所属分类，取值规则见下方【岗位分类】一节
 - status: 若能判断当前进度，从以下枚举中选择：{ALL_STATUSES}；无法判断填 ""
 - has_interview_time: true/false，邮件中是否包含具体的面试时间
 - interview_datetime: 若 has_interview_time 为 true，按 "YYYY-MM-DD HH:MM" 输出邮件中提到的原始时间（不要换算）
@@ -49,6 +55,12 @@ PARSE_SYSTEM_PROMPT = f"""你是求职邮件信息抽取助手。用户会给你
   给出对应的 IANA 时区名（如 Asia/Shanghai、America/New_York）；未提及则填 ""
 - location_or_link: 面试地点或会议链接，识别不到填 ""
 - notes: 简短备注
+
+【岗位分类】
+分类只看岗位职能本身，不要受公司所属行业影响（例如银行招的后端工程师属于「后端开发」，
+不属于「财务」）。请优先根据岗位名称判断，岗位名称含义不明时再结合邮件正文描述。
+
+{build_category_prompt_block()}
 
 只输出 JSON，不要输出解释性文字。"""
 
@@ -112,32 +124,48 @@ def fetch_recent_emails(days: int = 14, mailbox: str = "INBOX", limit: int = 50)
     返回列表，每项为 {"subject", "from", "date", "body"}。
     连接/认证失败会抛出异常，由调用方展示友好错误信息。
     """
-    host = os.getenv("IMAP_HOST", "imap.163.com")
-    user = os.getenv("IMAP_USER")
-    password = os.getenv("IMAP_PASS")
+    # strip() 防御性处理：.env 里的值如果多复制了一个换行/空格/引号，
+    # 163 服务器会把它当成密码的一部分，导致明明授权码是对的却登录失败
+    host = (os.getenv("IMAP_HOST", "imap.163.com") or "").strip()
+    user = (os.getenv("IMAP_USER") or "").strip()
+    password = (os.getenv("IMAP_PASS") or "").strip()
     if not user or not password:
         raise RuntimeError("环境变量 IMAP_USER / IMAP_PASS 未设置，无法同步163邮箱")
 
+    # imaplib 内置的 Commands 状态校验表里根本没有 "ID" 这个命令：
+    # imaplib.IMAP4._command() 第一步就是查 Commands[name]，"ID" 不在表里会
+    # 直接抛 KeyError——而且是在真正写 socket 之前就抛出，之前的实现用
+    # except Exception 把这个 KeyError 静默吞掉了，导致 ID 命令实际上从来
+    # 没有发送成功过（不管把它放在 login 前面还是后面都一样没用）。
+    # 这里必须先把 "ID" 注册成合法命令，NONAUTH 状态下才能真正发送出去。
+    if "ID" not in imaplib.Commands:
+        imaplib.Commands["ID"] = ("NONAUTH", "AUTH", "SELECTED", "LOGOUT")
+
     imap = imaplib.IMAP4_SSL(host)
     try:
-        imap.login(user, password)
-
-        # 163/126 要求客户端在登录成功后、发起 SELECT 等其他命令前先发送 ID
-        # 命令自报身份，否则服务端会把后续命令当作"不安全的登录方式"直接拒绝。
-        # 若 ID 发在 login 之前，或者压根没发送，SELECT 就会失败——但 imaplib
-        # 的 select() 失败时只是把连接状态退回 AUTH 并返回非 OK，并不抛异常，
-        # 于是下一步 search() 才会报出令人费解的
-        # "command SEARCH illegal in state AUTH, only allowed in states SELECTED"。
+        # 163/126/188 系邮箱要求客户端在 LOGIN 之前先发送 ID 命令自报身份，
+        # 否则服务端会把随后的 SELECT 判定为"不安全的登录方式"直接拒绝
+        # （典型报错："SELECT Unsafe Login. Please contact kefu@188.com for
+        # help"）。ID 必须在连接建立后、登录前发送，发在 login 之后无效。
         imap_id = (
             "name", "job-tracker-app",
             "version", "1.0",
             "vendor", "job-tracker-app",
             "contact", user,
         )
+        imap._simple_command("ID", '("' + '" "'.join(imap_id) + '")')
+
         try:
-            imap._simple_command("ID", '("' + '" "'.join(imap_id) + '")')
-        except Exception:
-            pass  # 部分账号/服务商无需此步骤，忽略即可
+            imap.login(user, password)
+        except imaplib.IMAP4.error as e:
+            raise RuntimeError(
+                f"登录163邮箱失败（{e}）。请逐项确认："
+                "① IMAP_USER 是完整邮箱地址（如 xxx@163.com）；"
+                "② IMAP_PASS 是163邮箱「设置 - POP3/SMTP/IMAP - 客户端授权密码」"
+                "页面生成的授权码，不是登录密码；"
+                "③ 授权码/密码最近改过的话，需要重新生成一次并同步更新到 .env，"
+                "且确认没有多复制出首尾空格或引号。"
+            ) from e
 
         typ, sel_data = imap.select(mailbox)
         if typ != "OK":
@@ -198,7 +226,6 @@ def parse_email_with_llm(mail: dict) -> dict | None:
             {"role": "user", "content": user_content},
         ],
         response_format={"type": "json_object"},
-        temperature=0,
     )
     data = json.loads(response.choices[0].message.content)
 
@@ -233,6 +260,12 @@ def parse_email_with_llm(mail: dict) -> dict | None:
     else:
         result["start_time_utc"] = None
         result["timezone_confirmed"] = False
+
+    # 邮件类型：供邮箱同步页面分组展示（笔试 / 面试 / offer通知 / 其他）
+    result["email_type"] = classify_email_type(
+        status=result["status"],
+        has_interview_time=result["has_interview_time"],
+    )
 
     return result
 

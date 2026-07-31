@@ -1,5 +1,7 @@
 streamlit>=1.32
 streamlit-calendar>=0.6.0
+streamlit-paste-button>=0.1.2
+altair>=5.0
 pandas>=2.0
 python-dotenv>=1.0
 openai>=1.30

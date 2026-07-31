@@ -11,6 +11,9 @@ app.py
 运行方式： streamlit run app.py
 """
 
+import os
+import time
+
 import streamlit as st
 
 from db import init_db
@@ -67,5 +70,23 @@ with st.sidebar:
     st.caption("环境变量提示：")
     st.caption("LLM_API_KEY / IMAP_HOST / IMAP_USER / IMAP_PASS")
     st.caption("目标时区：America/Chicago（美国达拉斯）")
+
+    st.divider()
+    if st.session_state.get("confirm_shutdown"):
+        st.warning("确定要关闭应用吗？关闭后需要重新启动才能再次打开。")
+        col_yes, col_no = st.columns(2)
+        with col_yes:
+            if st.button("✅ 确认关闭", key="btn_confirm_shutdown", width="stretch"):
+                st.success("正在关闭，可以直接关掉这个浏览器标签页啦～")
+                time.sleep(1)
+                os._exit(0)
+        with col_no:
+            if st.button("取消", key="btn_cancel_shutdown", width="stretch"):
+                st.session_state["confirm_shutdown"] = False
+                st.rerun()
+    else:
+        if st.button("🛑 关闭应用", key="btn_shutdown", width="stretch"):
+            st.session_state["confirm_shutdown"] = True
+            st.rerun()
 
 PAGES[choice]()

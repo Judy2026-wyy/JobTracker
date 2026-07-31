@@ -34,36 +34,46 @@ def _compute_pipeline(
     start_date: str = None,
     end_date: str = None,
     categories: list[str] = None,
-) -> pd.DataFrame:
-    """把 applications + status_history 拼装成投递看板所需的一行一条记录。"""
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """把 applications + status_history 拼装成投递看板所需的数据。
+
+    返回 (df, segments_df)：
+    - df：一行一条投递记录，供统计卡片、阶段日期表使用。
+    - segments_df：一行一个"阶段区间"，供进度时间线按阶段分段着色使用
+      （同一条投递按 status_history 拆成多段：每段从进入某阶段的时间，
+      到进入下一阶段的时间为止；最后一段延伸到当前时间）。
+    """
     apps = db.list_applications(start_date=start_date, end_date=end_date, categories=categories)
     if apps.empty:
-        return apps
+        return apps, pd.DataFrame()
 
     history = db.get_all_status_history()
     now = datetime.now(timezone.utc)
 
     rows = []
+    segment_rows = []
     for app in apps.itertuples():
-        app_hist = history[history["application_id"] == app.id]
+        label = f"{app.company} · {app.position}"
+        app_hist = history[history["application_id"] == app.id].sort_values("changed_at")
         stage_dates = {s: None for s in STATUS_FLOW}
         change_times = []
+        change_statuses = []
         for h in app_hist.itertuples():
             ts = parse_iso(h.changed_at)
             change_times.append(ts)
+            change_statuses.append(h.to_status)
             if h.to_status in stage_dates:
                 stage_dates[h.to_status] = ts
 
         gaps_days = [
-            (change_times[i + 1] - change_times[i]).total_seconds() / 86400
+            (change_times[i + 1] - change_times[i]).days
             for i in range(len(change_times) - 1)
         ]
         if change_times and app.status not in TERMINAL_STATUSES:
-            gaps_days.append((now - change_times[-1]).total_seconds() / 86400)
-        max_gap = max(gaps_days) if gaps_days else 0.0
+            gaps_days.append((now - change_times[-1]).days)
+        max_gap = max(gaps_days) if gaps_days else 0
 
         start_ts = change_times[0] if change_times else parse_iso(app.status_updated_at)
-        end_ts = now if app.status not in TERMINAL_STATUSES else (change_times[-1] if change_times else now)
 
         row = {
             "id": app.id,
@@ -71,17 +81,32 @@ def _compute_pipeline(
             "position": app.position,
             "岗位分类": app.category,
             "当前状态": app.status,
-            "最大间隔天数": round(max_gap, 1),
+            "最大间隔天数": int(max_gap),
             "跟进提示": "💭 催一下" if max_gap > threshold_days else "",
             "_start": start_ts,
-            "_end": end_ts,
         }
         for s in STATUS_FLOW:
             ts = stage_dates[s]
             row[s] = utc_iso_to_chicago(ts.isoformat()).strftime("%Y-%m-%d") if ts else ""
         rows.append(row)
 
-    return pd.DataFrame(rows)
+        for i in range(len(change_times)):
+            seg_start = change_times[i]
+            seg_end = change_times[i + 1] if i + 1 < len(change_times) else now
+            local_start = utc_iso_to_chicago(seg_start.isoformat())
+            segment_rows.append(
+                {
+                    "投递": label,
+                    "company": app.company,
+                    "position": app.position,
+                    "阶段": change_statuses[i],
+                    "start": seg_start,
+                    "end": seg_end,
+                    "start_label": f"{local_start.month}/{local_start.day}",
+                }
+            )
+
+    return pd.DataFrame(rows), pd.DataFrame(segment_rows)
 
 
 def _render_stat_cards(df: pd.DataFrame) -> None:
@@ -105,34 +130,45 @@ def _render_stat_cards(df: pd.DataFrame) -> None:
             st.caption("💭 有几条好久没消息啦，下面表格里看看～")
 
 
-def _render_timeline(df: pd.DataFrame) -> None:
+def _render_timeline(df: pd.DataFrame, segments_df: pd.DataFrame) -> None:
     st.markdown("#### 🗂️ 投递进度时间线")
+    st.caption("每条投递是一根横条，按阶段分段着色；每段开头的小字是进入该阶段的日期")
 
-    chart_df = df.copy()
-    chart_df["投递"] = chart_df["company"] + " · " + chart_df["position"]
-    order = chart_df.sort_values("_start")["投递"].tolist()
+    order = df.sort_values("_start")["company"].str.cat(df.sort_values("_start")["position"], sep=" · ").tolist()
 
-    chart = (
-        alt.Chart(chart_df)
-        .mark_bar(cornerRadius=6, height=14)
+    bars = (
+        alt.Chart(segments_df)
+        .mark_bar(cornerRadius=4, height=14)
         .encode(
-            x=alt.X("_start:T", title=None),
-            x2="_end:T",
+            x=alt.X("start:T", title=None),
+            x2="end:T",
             y=alt.Y("投递:N", sort=order, title=None),
             color=alt.Color(
-                "当前状态:N",
+                "阶段:N",
                 scale=alt.Scale(domain=list(STATUS_COLOR.keys()), range=list(STATUS_COLOR.values())),
-                legend=alt.Legend(title="当前状态", orient="bottom", columns=5),
+                legend=alt.Legend(title="阶段", orient="bottom", columns=5),
             ),
             tooltip=[
                 alt.Tooltip("company:N", title="公司"),
                 alt.Tooltip("position:N", title="岗位"),
-                alt.Tooltip("当前状态:N", title="当前状态"),
-                alt.Tooltip("最大间隔天数:Q", title="最长停留(天)", format=".1f"),
+                alt.Tooltip("阶段:N", title="阶段"),
+                alt.Tooltip("start:T", title="开始", format="%Y-%m-%d"),
+                alt.Tooltip("end:T", title="结束/至今", format="%Y-%m-%d"),
             ],
         )
-        .properties(height=max(220, 32 * len(chart_df)))
     )
+
+    labels = (
+        alt.Chart(segments_df)
+        .mark_text(align="left", dx=3, dy=-10, fontSize=9, color="#c3c2b7")
+        .encode(
+            x=alt.X("start:T"),
+            y=alt.Y("投递:N", sort=order),
+            text=alt.Text("start_label:N"),
+        )
+    )
+
+    chart = (bars + labels).properties(height=max(220, 36 * len(df)))
     st.altair_chart(chart, width="stretch")
 
 
@@ -177,13 +213,15 @@ def render_pipeline_page() -> None:
         key="pipeline_stale_threshold",
     )
 
-    df = _compute_pipeline(threshold_days, start_date=start_date, end_date=end_date, categories=categories)
+    df, segments_df = _compute_pipeline(
+        threshold_days, start_date=start_date, end_date=end_date, categories=categories
+    )
     if df.empty:
         st.info("这里还空着呢～去「全部记录」新增或导入数据，或者调整一下筛选条件吧")
         return
 
     _render_stat_cards(df)
     st.divider()
-    _render_timeline(df)
+    _render_timeline(df, segments_df)
     st.divider()
     _render_table(df)
