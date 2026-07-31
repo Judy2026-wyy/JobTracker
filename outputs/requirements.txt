@@ -1,0 +1,6 @@
+streamlit>=1.32
+streamlit-calendar>=0.6.0
+pandas>=2.0
+python-dotenv>=1.0
+openai>=1.30
+tzdata>=2024.1

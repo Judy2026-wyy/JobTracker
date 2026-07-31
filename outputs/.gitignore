@@ -1,0 +1,14 @@
+# secrets
+.env
+
+# local database
+job_tracker.db
+
+# python
+__pycache__/
+*.pyc
+
+# venv
+.venv/
+venv/
+myenv/

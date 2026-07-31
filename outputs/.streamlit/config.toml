@@ -1,0 +1,10 @@
+# 暗色主题：整体视觉参照参考截图（深色卡片式仪表盘）。
+# base="dark" 让 Streamlit 内置组件（按钮/输入框/表格等）也统一走暗色配色，
+# 比单纯用 CSS 强行覆盖浅色主题更稳定、不容易在版本升级后局部露白。
+[theme]
+base = "dark"
+primaryColor = "#0ca30c"
+backgroundColor = "#0d0d0d"
+secondaryBackgroundColor = "#1a1a19"
+textColor = "#ffffff"
+font = "sans serif"
