@@ -4,8 +4,8 @@ ui_calendar.py
 月历板块：使用 streamlit-calendar（基于 FullCalendar）展示月视图，
 每场面试渲染为一张任务卡片（公司 + 轮次），并支持切换月份查看历史面试。
 
-时间展示：日历 calendarOptions 设置 timeZone="America/Chicago"，
-事件本身以 UTC ISO 字符串传入，由 FullCalendar 自动换算为达拉斯本地时间展示，
+时间展示：日历 calendarOptions 的 timeZone 取侧边栏「时区设置」选定的时区，
+事件本身以 UTC ISO 字符串传入，由 FullCalendar 自动换算为该时区的本地时间展示，
 与其余板块的时区处理口径保持一致。
 """
 
@@ -14,8 +14,8 @@ from datetime import date, timedelta
 import streamlit as st
 
 import db
-from config import TARGET_TIMEZONE, STATUS_COLOR
-from timezone_utils import format_chicago
+from config import STATUS_COLOR
+from timezone_utils import format_local, get_display_timezone, get_display_timezone_label
 
 try:
     from streamlit_calendar import calendar as st_calendar
@@ -83,9 +83,11 @@ def render_calendar():
 
     events = _build_events(df)
 
+    st.caption(f"日历时间按「{get_display_timezone_label()}」展示，可在侧边栏「时区设置」里切换")
+
     calendar_options = {
         "initialView": "dayGridMonth",
-        "timeZone": TARGET_TIMEZONE,
+        "timeZone": get_display_timezone(),
         "headerToolbar": {
             "left": "prev,next today",
             "center": "title",
@@ -104,7 +106,7 @@ def render_calendar():
         st.write(f"**岗位**：{props.get('position', '')}")
         st.write(f"**轮次**：{props.get('round', '')}")
         if start:
-            st.write(f"**时间（美国达拉斯 America/Chicago）**：{format_chicago(start)}")
+            st.write(f"**时间（{get_display_timezone_label()}）**：{format_local(start)}")
         st.write(f"**地点/链接**：{props.get('location_or_link', '（未填写）')}")
         if not props.get("timezone_confirmed"):
             st.warning("该面试时间的时区尚未确认，请核实后在「全部投递记录」中更新")

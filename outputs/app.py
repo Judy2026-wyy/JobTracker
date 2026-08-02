@@ -23,6 +23,7 @@ from ui_email_sync import render_email_sync
 from ui_calendar import render_calendar
 from ui_applications import render_applications_page
 from ui_pipeline import render_pipeline_page
+from ui_timezone import render_timezone_settings
 
 st.set_page_config(
     page_title="求职追踪看板",
@@ -69,7 +70,11 @@ with st.sidebar:
     st.divider()
     st.caption("环境变量提示：")
     st.caption("LLM_API_KEY / IMAP_HOST / IMAP_USER / IMAP_PASS")
-    st.caption("目标时区：America/Chicago（美国达拉斯）")
+
+    st.divider()
+    # 时区设置放在「关闭应用」上方：它决定全站面试时间怎么展示，
+    # 且必须在页面主体渲染之前跑，这样改完当次就生效，不用再刷一遍
+    render_timezone_settings()
 
     st.divider()
     if st.session_state.get("confirm_shutdown"):

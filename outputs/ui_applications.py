@@ -15,9 +15,10 @@ from datetime import date, datetime, time
 import streamlit as st
 
 import db
+import dedup
 from category_classifier import classify_positions
 from config import STATUS_FLOW, SOURCES, CATEGORIES, get_valid_next_statuses
-from timezone_utils import to_utc_iso as _to_utc_iso
+from timezone_utils import get_display_timezone_label, to_utc_iso as _to_utc_iso
 from ui_filters import render_filters
 
 
@@ -52,7 +53,11 @@ def render_manual_add():
                 if created:
                     st.success(f"记录保存好啦（ID={app_id}），加油！")
                 else:
-                    st.info(f"这条记录（公司+岗位+投递日期一样）已经有啦，就不重复添加了，ID={app_id}")
+                    existing = db.get_application(app_id) or {}
+                    st.info(
+                        f"库里已经有同一次投递了：#{app_id}「{existing.get('company', '')} · "
+                        f"{existing.get('position', '')}」，就不重复添加了"
+                    )
 
 
 def render_status_transition():
@@ -108,6 +113,9 @@ def render_add_interview():
         source_tz = st.text_input(
             "时间所在时区（IANA 名称，如 Asia/Shanghai、America/Chicago）",
             value="Asia/Shanghai",
+            help="填的是**面试通知里那个时间本身属于哪个时区**（对方约的是几点），"
+            f"不是你的展示时区。存进库后会自动换算成你在侧边栏选的"
+            f"「{get_display_timezone_label()}」来展示。",
         )
         location = st.text_input("地点 / 会议链接")
         notes = st.text_area("备注")
@@ -175,6 +183,82 @@ def render_applications_table():
                 db.delete_application(options[choice])
                 st.success("已删除")
                 st.rerun()
+
+
+def _record_label(record: dict) -> str:
+    return (
+        f"#{record['id']} {record.get('company', '')} · {record.get('position', '')}"
+        f"（状态: {record.get('status', '')}｜投递日期: {record.get('applied_date', '')}"
+        f"｜来源: {record.get('source', '')}）"
+    )
+
+
+def _render_duplicate_group(group_id: str, records: list[dict], hint: str) -> None:
+    """一组疑似重复记录：选一条保留，其余合并进它。"""
+    with st.container(border=True):
+        st.markdown(f"**{hint}**")
+        options = {_record_label(record): int(record["id"]) for record in records}
+        keep_label = st.radio(
+            "保留哪一条？（其余记录会合并进它，面试安排和状态流转历史都会一起搬过去）",
+            list(options.keys()),
+            key=f"dup_keep_{group_id}",
+        )
+        keep_id = options[keep_label]
+        if st.button("🔗 合并这一组", key=f"btn_merge_{group_id}"):
+            merged, failed = 0, []
+            for record in records:
+                record_id = int(record["id"])
+                if record_id == keep_id:
+                    continue
+                ok, msg = db.merge_applications(keep_id, record_id)
+                if ok:
+                    merged += 1
+                else:
+                    failed.append(msg)
+            if merged:
+                st.success(f"合并好啦，{merged} 条记录已经并进 #{keep_id}")
+            for msg in failed:
+                st.error(msg)
+            st.rerun()
+
+
+def render_duplicate_cleanup():
+    """重复投递记录的检查与合并（数据表层面的去重）。"""
+    with st.expander("🧹 重复投递记录检查与合并", expanded=False):
+        st.caption(
+            "把公司名和岗位名归一化后比对（「德勤」与「德勤中国」、"
+            "「安永（中国）有限公司」与「安永」都算同一家），找出同一次投递被登记了多次的记录。"
+            "合并时面试安排、状态流转历史都会保留，状态取进度更靠前的那个，投递日期取更早的那个。"
+        )
+
+        groups = db.find_duplicate_groups()
+        all_apps = db.list_applications()
+        records = all_apps.to_dict("records") if not all_apps.empty else []
+        pairs = dedup.find_similar_pairs(records)
+
+        if not groups and not pairs:
+            st.success("没有发现重复的投递记录 🎉")
+            return
+
+        if groups:
+            st.markdown(f"**完全重复（公司+岗位归一化后一致）：{len(groups)} 组**")
+            for i, group in enumerate(groups):
+                _render_duplicate_group(
+                    f"exact_{i}",
+                    group,
+                    f"「{group[0].get('company', '')} · {group[0].get('position', '')}」等 {len(group)} 条记录",
+                )
+
+        if pairs:
+            st.markdown(f"**疑似重复（写法不同，需要你确认）：{len(pairs)} 组**")
+            st.caption("这些记录只是「像」，不一定真是同一次投递，确认清楚再合并")
+            for i, pair in enumerate(pairs):
+                _render_duplicate_group(
+                    f"fuzzy_{i}",
+                    [pair["a"], pair["b"]],
+                    f"公司相似度 {pair['company_similarity']:.0%}，"
+                    f"岗位相似度 {pair['position_similarity']:.0%}",
+                )
 
 
 def _needs_reclassify(category: str) -> bool:
@@ -280,6 +364,7 @@ def render_reclassify():
 
 def render_applications_page():
     render_applications_table()
+    render_duplicate_cleanup()
     render_reclassify()
     st.divider()
     tab1, tab2, tab3 = st.tabs(["手动新增", "状态流转", "添加面试安排"])

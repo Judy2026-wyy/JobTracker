@@ -23,7 +23,9 @@ from config import (
     STATUS_FLOW,
     TERMINAL_STATUSES,
     get_valid_next_statuses,
+    is_forward_status,
 )
+from dedup import normalize_company, normalize_position
 
 
 def get_connection() -> sqlite3.Connection:
@@ -72,9 +74,16 @@ def init_db() -> None:
                 changed_at TEXT NOT NULL,
                 FOREIGN KEY (application_id) REFERENCES applications(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         conn.commit()
+        reset_settings_cache()  # 换库/重新初始化时别把上一个库的设置带过来
         _ensure_category_column(conn)
         _migrate_legacy_categories(conn)
         _backfill_status_history(conn)
@@ -153,8 +162,90 @@ def _now_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
+# app_settings 表操作（应用级偏好设置，目前存展示时区）
+# ---------------------------------------------------------------------------
+
+# 设置项在一次进程里读得非常频繁（每渲染一个面试时间就要问一次时区），
+# 而写入只发生在用户点下拉框的那一刻，所以在内存里缓存一份，写入时同步更新。
+# 单机单用户应用，不存在别的进程偷偷改库的情况。
+_SETTINGS_CACHE: dict[str, str] = {}
+_SETTINGS_LOADED = False
+
+
+def reset_settings_cache() -> None:
+    """丢掉缓存，下次读设置时重新查库（切换数据库文件后必须调用）。"""
+    global _SETTINGS_LOADED
+    _SETTINGS_CACHE.clear()
+    _SETTINGS_LOADED = False
+
+
+def _load_settings() -> dict[str, str]:
+    global _SETTINGS_LOADED
+    if _SETTINGS_LOADED:
+        return _SETTINGS_CACHE
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT key, value FROM app_settings;").fetchall()
+        _SETTINGS_CACHE.clear()
+        _SETTINGS_CACHE.update({row["key"]: row["value"] for row in rows})
+        _SETTINGS_LOADED = True
+    except sqlite3.OperationalError:
+        # 表还没建（比如 init_db 之前就有人来读），当作"还没设置过"，用默认值
+        pass
+    finally:
+        conn.close()
+    return _SETTINGS_CACHE
+
+
+def get_setting(key: str, default: str = None) -> str | None:
+    return _load_settings().get(key, default)
+
+
+def set_setting(key: str, value: str) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at;
+            """,
+            (key, value, _now_iso()),
+        )
+        conn.commit()
+        _load_settings()[key] = value
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # applications 表操作
 # ---------------------------------------------------------------------------
+
+def find_normalized_duplicate(company: str, position: str, exclude_id: int = None) -> dict | None:
+    """按归一化后的公司名+岗位名查找已有记录，找到返回该记录，否则 None。
+
+    这是「同一次投递不要注册两遍」的数据层兜底：UNIQUE(company, position,
+    applied_date) 只能拦住三个字段一模一样的重复，拦不住「德勤 / 德勤中国」
+    这种写法不同、或者同一条投递隔几天又被邮件带进来一次（日期不同）的情况。
+    归一化规则见 dedup.normalize_company / normalize_position。
+
+    同时命中多条时返回 id 最小的那条（最早登记的），保证结果稳定可预期。
+    """
+    target = (normalize_company(company), normalize_position(position))
+    if not target[0] and not target[1]:
+        return None
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT * FROM applications ORDER BY id;").fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        if exclude_id is not None and row["id"] == exclude_id:
+            continue
+        if (normalize_company(row["company"]), normalize_position(row["position"])) == target:
+            return dict(row)
+    return None
+
 
 def upsert_application(
     company: str,
@@ -165,11 +256,25 @@ def upsert_application(
     source: str = "manual",
     notes: str = None,
     category: str = DEFAULT_CATEGORY,
+    allow_duplicate: bool = False,
 ) -> tuple[int, bool]:
-    """插入新投递记录；若 (company, position, applied_date) 已存在则跳过插入（去重）。
+    """插入新投递记录，命中去重则跳过插入。
+
+    去重分两层：
+    1. 归一化去重：公司名+岗位名归一化后一致就算同一次投递（不看投递日期），
+       能拦住「德勤 / 德勤中国」「同一条投递隔天又被邮件带进来」这类重复。
+    2. UNIQUE(company, position, applied_date) 约束：数据库层最后一道保险。
+
+    allow_duplicate=True 时跳过第 1 层（用户已明确说「这不是同一条，就是要新建」），
+    但第 2 层的数据库约束仍然生效。
 
     返回 (application_id, created)，created=False 表示命中去重、未新建。
     """
+    if not allow_duplicate:
+        existing = find_normalized_duplicate(company, position)
+        if existing:
+            return existing["id"], False
+
     now_iso = _now_iso()
     conn = get_connection()
     try:
@@ -236,6 +341,70 @@ def update_status(application_id: int, new_status: str) -> tuple[bool, str]:
         conn.close()
 
 
+def advance_status(application_id: int, new_status: str) -> tuple[bool, str]:
+    """把某条投递的状态直接推进到 new_status（允许一次跨多个阶段，但不允许倒退）。
+
+    专供「外部信息带来的进度更新」使用（邮件同步确认合并到已有记录时）：
+    邮件里说已经约二面了，而库里还停在「已投递」，这时用户不该被迫手动点
+    四五次流转；但一封迟到的旧邮件也绝不能把记录打回更早的阶段。
+
+    返回 (是否更新, 提示信息)。状态没变化/倒退时返回 (False, 原因)。
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT status FROM applications WHERE id=?;", (application_id,)
+        ).fetchone()
+        if row is None:
+            return False, "未找到该投递记录"
+        current = row["status"]
+        if new_status == current:
+            return False, f"状态还是「{current}」，没变化"
+        if not is_forward_status(current, new_status):
+            return False, f"「{new_status}」比当前的「{current}」更早（或已到终止态），保持原状态不动"
+        now_iso = _now_iso()
+        conn.execute(
+            "UPDATE applications SET status=?, status_updated_at=? WHERE id=?;",
+            (new_status, now_iso, application_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO status_history (application_id, from_status, to_status, changed_at)
+            VALUES (?, ?, ?, ?);
+            """,
+            (application_id, current, new_status, now_iso),
+        )
+        conn.commit()
+        return True, f"状态已从「{current}」更新为「{new_status}」"
+    finally:
+        conn.close()
+
+
+def append_notes(application_id: int, text: str) -> None:
+    """把一段新信息追加到备注末尾（已经包含同样内容时不重复追加）。
+
+    合并投递记录时用：邮件里的新信息要留痕，但不能把原来截图提炼的岗位信息覆盖掉。
+    """
+    text = (text or "").strip()
+    if not text:
+        return
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT notes FROM applications WHERE id=?;", (application_id,)
+        ).fetchone()
+        if row is None:
+            return
+        old = (row["notes"] or "").strip()
+        if text in old:
+            return
+        merged = f"{old}\n{text}".strip() if old else text
+        conn.execute("UPDATE applications SET notes=? WHERE id=?;", (merged, application_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def update_application_fields(application_id: int, **fields) -> None:
     """更新 applications 表中的任意可编辑字段（company/position/job_link/notes 等）。"""
     if not fields:
@@ -298,6 +467,97 @@ def list_applications(
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY applied_date DESC, id DESC;"
         return pd.read_sql(query, conn, params=params)
+    finally:
+        conn.close()
+
+
+def find_duplicate_groups() -> list[list[dict]]:
+    """扫描全表，把归一化后公司名+岗位名相同的记录分成一组，返回所有存在重复的组。
+
+    每组按 id 升序，组内第一条是最早登记的（合并时默认保留它）。
+    供「全部记录」页面的重复记录清理工具使用。
+    """
+    conn = get_connection()
+    try:
+        rows = [dict(row) for row in conn.execute("SELECT * FROM applications ORDER BY id;")]
+    finally:
+        conn.close()
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        key = (normalize_company(row["company"]), normalize_position(row["position"]))
+        if not key[0] and not key[1]:
+            continue  # 公司岗位都是空/占位值，不参与分组，避免把所有脏数据归成一堆
+        groups.setdefault(key, []).append(row)
+    return [group for group in groups.values() if len(group) > 1]
+
+
+def merge_applications(keep_id: int, merge_id: int) -> tuple[bool, str]:
+    """把 merge_id 这条投递合并进 keep_id，然后删除 merge_id。
+
+    合并策略：
+    - 面试安排、状态流转历史全部改挂到 keep_id 名下，一条都不丢；
+    - 状态取两者中更靠前的那个（进度更深的赢），并补一条流转历史；
+    - 投递日期取更早的那个（第一次投出去的时间才是真正的投递日）；
+    - 备注拼接、投递链接/分类空缺时用被合并记录的值补上。
+    """
+    if keep_id == merge_id:
+        return False, "保留记录和被合并记录不能是同一条"
+    conn = get_connection()
+    try:
+        keep = conn.execute("SELECT * FROM applications WHERE id=?;", (keep_id,)).fetchone()
+        merge = conn.execute("SELECT * FROM applications WHERE id=?;", (merge_id,)).fetchone()
+        if keep is None or merge is None:
+            return False, "要合并的记录已经不存在了，刷新一下再试"
+
+        conn.execute(
+            "UPDATE interviews SET application_id=? WHERE application_id=?;", (keep_id, merge_id)
+        )
+        conn.execute(
+            "UPDATE status_history SET application_id=? WHERE application_id=?;",
+            (keep_id, merge_id),
+        )
+
+        updates = {}
+        if is_forward_status(keep["status"], merge["status"]):
+            updates["status"] = merge["status"]
+            updates["status_updated_at"] = _now_iso()
+        if merge["applied_date"] and (
+            not keep["applied_date"] or merge["applied_date"] < keep["applied_date"]
+        ):
+            updates["applied_date"] = merge["applied_date"]
+        if not (keep["job_link"] or "").strip() and (merge["job_link"] or "").strip():
+            updates["job_link"] = merge["job_link"]
+        if (keep["category"] in (None, "", DEFAULT_CATEGORY)) and merge["category"] not in (
+            None,
+            "",
+            DEFAULT_CATEGORY,
+        ):
+            updates["category"] = merge["category"]
+
+        keep_notes = (keep["notes"] or "").strip()
+        merge_notes = (merge["notes"] or "").strip()
+        if merge_notes and merge_notes not in keep_notes:
+            updates["notes"] = f"{keep_notes}\n{merge_notes}".strip()
+
+        if updates:
+            set_clause = ", ".join(f"{k}=?" for k in updates)
+            conn.execute(
+                f"UPDATE applications SET {set_clause} WHERE id=?;",
+                [*updates.values(), keep_id],
+            )
+        if "status" in updates:
+            conn.execute(
+                """
+                INSERT INTO status_history (application_id, from_status, to_status, changed_at)
+                VALUES (?, ?, ?, ?);
+                """,
+                (keep_id, keep["status"], updates["status"], updates["status_updated_at"]),
+            )
+
+        conn.execute("DELETE FROM applications WHERE id=?;", (merge_id,))
+        conn.commit()
+        return True, f"已把 #{merge_id} 合并进 #{keep_id}"
     finally:
         conn.close()
 

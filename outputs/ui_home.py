@@ -2,9 +2,10 @@
 ui_home.py
 ----------
 首页板块：
-1. 提醒条 —— 未来 48 小时内的面试，按时间升序展示（公司 + 轮次 + America/Chicago
-   本地时间 + 地点/链接）；timezone_confirmed=False 的记录单独分组标注"时间待确认"，
-   不参与正常排序展示；无待办时显示空状态提示。
+1. 提醒条 —— 未来 48 小时内的面试，按时间升序展示（公司 + 轮次 + 本地时间 +
+   地点/链接）。本地时间按侧边栏「时区设置」选定的时区换算，时间后面会标出
+   当前是哪个时区，避免看错；timezone_confirmed=False 的记录单独分组标注
+   "时间待确认"，不参与正常排序展示；无待办时显示空状态提示。
 2. 简单统计 —— 各状态数量、投递→面试转化率。
 3. 投递趋势折线图 —— X 轴为投递日期、Y 轴为当日投递数，支持切换统计周期
    （最近7/30/90天或全部），没有投递的日期补 0 使折线连续。
@@ -17,7 +18,7 @@ import pandas as pd
 import streamlit as st
 
 import db
-from timezone_utils import format_chicago
+from timezone_utils import format_local, get_display_timezone_label
 
 # 与 config.STATUS_COLOR 的分类色板同一套蓝色（slot 1），单一数据系列直接用它，
 # 不需要额外图例
@@ -44,11 +45,12 @@ def render_reminder_bar():
         if upcoming.empty:
             st.info("接下来 48 小时暂时没有安排好的面试，可以喘口气～ ✅")
         else:
+            tz_label = get_display_timezone_label()
             for _, row in upcoming.iterrows():
-                local_time = format_chicago(row["start_time_utc"])
+                local_time = format_local(row["start_time_utc"])
                 location = row["location_or_link"] or "（未填写地点/链接）"
                 st.markdown(
-                    f"**{row['company']}** · {row['round']} · 🕒 {local_time}（美国达拉斯时间）· 📍 {location}"
+                    f"**{row['company']}** · {row['round']} · 🕒 {local_time}（{tz_label}）· 📍 {location}"
                 )
 
     try:

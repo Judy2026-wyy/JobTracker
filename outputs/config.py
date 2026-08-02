@@ -23,10 +23,84 @@ DB_PATH = os.getenv("JOB_TRACKER_DB_PATH", "job_tracker.db")
 # ---------------------------------------------------------------------------
 # 时区
 # ---------------------------------------------------------------------------
-# 目标展示时区：美国达拉斯所在时区（自动处理夏令时，不要硬编码 UTC-5/UTC-6）
-TARGET_TIMEZONE = "America/Chicago"
+# 展示时区的出厂默认值。真正生效的时区由用户在侧边栏「时区设置」里选，存在
+# 数据库的 app_settings 表里（见 db.get_setting / timezone_utils.get_display_timezone），
+# 这里只是没设置过时的兜底。一律用 IANA 时区名，不硬编码 UTC±N 偏移量——
+# zoneinfo 会按具体日期自动处理夏令时切换。
+DEFAULT_DISPLAY_TIMEZONE = "America/Chicago"
 # 邮件中面试时间若未显式标注时区，默认按国内招聘场景假设为北京时间
 DEFAULT_SOURCE_TIMEZONE = "Asia/Shanghai"
+
+# app_settings 表里的键名
+SETTING_DISPLAY_TIMEZONE = "display_timezone"
+SETTING_DISPLAY_TIMEZONE_LABEL = "display_timezone_label"
+
+# 中国全境行政上统一使用北京时间，所以选了中国就不必再问城市
+CHINA_COUNTRY = "中国"
+CHINA_TIMEZONE = "Asia/Shanghai"
+CHINA_CITY_LABEL = "北京时间（全国统一）"
+# 列表里没有的地方，让用户直接填 IANA 时区名
+CUSTOM_COUNTRY = "其他（手动填时区名）"
+
+# 国家/地区 -> {城市档位: IANA 时区名}
+# 只收录求职者常去的国家，跨时区的国家按"时区档位"列城市（同一档位的城市共用
+# 一个时区，写在一起便于用户按自己所在城市对号入座），单时区国家只有一项。
+COUNTRY_TIMEZONES: dict[str, dict[str, str]] = {
+    CHINA_COUNTRY: {CHINA_CITY_LABEL: CHINA_TIMEZONE},
+    "美国": {
+        "纽约 / 波士顿 / 华盛顿（东部时间）": "America/New_York",
+        "芝加哥 / 达拉斯 / 休斯顿（中部时间）": "America/Chicago",
+        "丹佛 / 盐湖城（山地时间）": "America/Denver",
+        "凤凰城（山地时间，不实行夏令时）": "America/Phoenix",
+        "洛杉矶 / 旧金山 / 西雅图（太平洋时间）": "America/Los_Angeles",
+        "安克雷奇（阿拉斯加时间）": "America/Anchorage",
+        "檀香山（夏威夷时间）": "Pacific/Honolulu",
+    },
+    "加拿大": {
+        "多伦多 / 渥太华 / 蒙特利尔（东部时间）": "America/Toronto",
+        "温尼伯（中部时间）": "America/Winnipeg",
+        "卡尔加里 / 埃德蒙顿（山地时间）": "America/Edmonton",
+        "温哥华 / 维多利亚（太平洋时间）": "America/Vancouver",
+        "哈利法克斯（大西洋时间）": "America/Halifax",
+    },
+    "英国": {"伦敦 / 曼彻斯特 / 爱丁堡": "Europe/London"},
+    "爱尔兰": {"都柏林": "Europe/Dublin"},
+    "德国": {"柏林 / 慕尼黑 / 法兰克福": "Europe/Berlin"},
+    "法国": {"巴黎": "Europe/Paris"},
+    "荷兰": {"阿姆斯特丹": "Europe/Amsterdam"},
+    "瑞士": {"苏黎世 / 日内瓦": "Europe/Zurich"},
+    "澳大利亚": {
+        "悉尼 / 墨尔本 / 堪培拉（东部时间）": "Australia/Sydney",
+        "布里斯班（东部时间，不实行夏令时）": "Australia/Brisbane",
+        "阿德莱德（中部时间）": "Australia/Adelaide",
+        "珀斯（西部时间）": "Australia/Perth",
+    },
+    "新西兰": {"奥克兰 / 惠灵顿": "Pacific/Auckland"},
+    "新加坡": {"新加坡": "Asia/Singapore"},
+    "日本": {"东京 / 大阪": "Asia/Tokyo"},
+    "韩国": {"首尔": "Asia/Seoul"},
+    "马来西亚": {"吉隆坡": "Asia/Kuala_Lumpur"},
+    "印度": {"班加罗尔 / 孟买 / 新德里": "Asia/Kolkata"},
+    "阿联酋": {"迪拜 / 阿布扎比": "Asia/Dubai"},
+    CUSTOM_COUNTRY: {},
+}
+
+
+def find_timezone_location(tz_name: str) -> tuple[str, str] | None:
+    """IANA 时区名 -> (国家/地区, 城市档位)；列表里没有则返回 None。
+
+    用于把已保存的时区反查回下拉框该选哪两项。
+    """
+    for country, cities in COUNTRY_TIMEZONES.items():
+        for city, name in cities.items():
+            if name == tz_name:
+                return country, city
+    return None
+
+
+def build_timezone_label(country: str, city: str) -> str:
+    """给用户看的时区说明，如「中国 · 北京时间（全国统一）」。"""
+    return f"{country} · {city}" if city else country
 
 # ---------------------------------------------------------------------------
 # 状态枚举与流转规则
@@ -111,6 +185,58 @@ def get_valid_next_statuses(current_status: str):
     options.extend(TERMINAL_STATUSES)
     return options
 
+
+def is_forward_status(current_status: str, new_status: str) -> bool:
+    """new_status 相对 current_status 是不是「往前推进」（含转入终止态）。
+
+    与 get_valid_next_statuses 的区别：那个函数管的是「用户在界面上手动流转」，
+    只允许一步一步走；这个函数管的是「外部信息（邮件）告诉我们进度已经到哪了」，
+    允许一次跨多个阶段（投完简历直接收到二面通知是常事），但绝不允许倒退，
+    免得一封旧邮件把已经推进到 HR 面的记录打回「已投递」。
+    """
+    if not new_status or new_status == current_status:
+        return False
+    if current_status in TERMINAL_STATUSES:
+        return False  # 已拒绝/已终止是终点，不再变
+    if new_status in TERMINAL_STATUSES:
+        return True
+    if current_status not in STATUS_FLOW or new_status not in STATUS_FLOW:
+        return False
+    return STATUS_FLOW.index(new_status) > STATUS_FLOW.index(current_status)
+
+
+def status_depth(status: str) -> int:
+    """状态在推进链路上的深度（STATUS_FLOW 下标）；不在链路上的返回 -1。
+
+    终止态（已拒绝/已终止）返回 -1：它们不是"走到了哪一步"，而是"结束了"。
+    一条投递到底走到过多深，要看它的历史轨迹里非终止状态的最大深度，
+    不能看当前状态——状态一旦转成已拒绝就把之前的进度覆盖掉了。
+    """
+    return STATUS_FLOW.index(status) if status in STATUS_FLOW else -1
+
+
+# ---------------------------------------------------------------------------
+# 投递漏斗（投递看板的漏斗分析图）
+# ---------------------------------------------------------------------------
+# 每一层： (显示名, 进入该层所需达到的最低状态)。
+# 口径是"至少走到了这一层"：某条投递只要历史上到过 >= 该状态的深度就计入，
+# 所以层层递减，天然构成漏斗。
+#
+# 与 STATUS_FLOW 的三点差异（按需求裁剪，只影响这张图，不影响状态流转本身）：
+# 1. 「已投递」与「简历筛选中」合并成同一层——简历筛选是投递之后的被动等待，
+#    分成两层看不出转化，合并后第一层就等于"总投递数"。
+# 2. 去掉「HR面」层。但 HR面 仍然计入深度：走到 HR面 的投递在漏斗里会被算进
+#    「三面」层（它确实已经走过了三面这一层），只是不单独占一层。
+# 3. 去掉「已拒绝」层。被拒不是漏斗的一层，而是每一层的流失；它体现在
+#    下一层的人数变少上，单独列一层反而会把转化率算重。
+FUNNEL_STAGES = [
+    ("已投递", "已投递"),
+    ("笔试", "笔试"),
+    ("一面", "一面"),
+    ("二面", "二面"),
+    ("三面", "三面"),
+    ("已收offer", "已收offer"),
+]
 
 # 面试阶段起点：达到该状态即视为"进入面试环节"（用于统计口径备用）
 INTERVIEW_START_STATUS = "笔试"
