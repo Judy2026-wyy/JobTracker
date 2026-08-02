@@ -52,6 +52,8 @@ def init_db() -> None:
                 source TEXT NOT NULL CHECK(source IN ('screenshot','email','manual')),
                 notes TEXT,
                 category TEXT NOT NULL DEFAULT '其他',
+                assessment_deadline_utc TEXT,
+                assessment_deadline_confirmed INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(company, position, applied_date)
             );
 
@@ -84,7 +86,7 @@ def init_db() -> None:
         )
         conn.commit()
         reset_settings_cache()  # 换库/重新初始化时别把上一个库的设置带过来
-        _ensure_category_column(conn)
+        _ensure_application_columns(conn)
         _migrate_legacy_categories(conn)
         _backfill_status_history(conn)
         conn.commit()
@@ -92,14 +94,23 @@ def init_db() -> None:
         conn.close()
 
 
-def _ensure_category_column(conn: sqlite3.Connection) -> None:
-    """给建表前已存在的 applications 表补上 category 列（CREATE TABLE IF NOT EXISTS
-    对已存在的表不会补字段，只能用 ALTER TABLE 迁移）。可重复执行。"""
+def _ensure_application_columns(conn: sqlite3.Connection) -> None:
+    """给建表前已存在的 applications 表补上后加的字段。
+
+    CREATE TABLE IF NOT EXISTS 对已存在的表不会补字段，只能 ALTER TABLE 迁移。
+    可重复执行：每次只补当前缺的列。
+    """
     cols = [row["name"] for row in conn.execute("PRAGMA table_info(applications);").fetchall()]
-    if "category" not in cols:
-        conn.execute(
-            f"ALTER TABLE applications ADD COLUMN category TEXT NOT NULL DEFAULT '{DEFAULT_CATEGORY}';"
-        )
+    pending = {
+        "category": f"TEXT NOT NULL DEFAULT '{DEFAULT_CATEGORY}'",
+        # 笔试/测评的最晚提交时间（UTC ISO），供首页「近期笔试 Deadline」使用
+        "assessment_deadline_utc": "TEXT",
+        # 邮件里是否明确写了时区；没写的按北京时间解释并标注待确认
+        "assessment_deadline_confirmed": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, ddl in pending.items():
+        if column not in cols:
+            conn.execute(f"ALTER TABLE applications ADD COLUMN {column} {ddl};")
 
 
 def _migrate_legacy_categories(conn: sqlite3.Connection) -> int:
@@ -528,6 +539,13 @@ def merge_applications(keep_id: int, merge_id: int) -> tuple[bool, str]:
             updates["applied_date"] = merge["applied_date"]
         if not (keep["job_link"] or "").strip() and (merge["job_link"] or "").strip():
             updates["job_link"] = merge["job_link"]
+        # 笔试截止时间：保留的那条没有就补上；两条都有则取更早的那个
+        # （宁可提前提醒，也不能因为合并把更紧的 deadline 弄丢）
+        keep_deadline = (keep["assessment_deadline_utc"] or "").strip()
+        merge_deadline = (merge["assessment_deadline_utc"] or "").strip()
+        if merge_deadline and (not keep_deadline or merge_deadline < keep_deadline):
+            updates["assessment_deadline_utc"] = merge_deadline
+            updates["assessment_deadline_confirmed"] = merge["assessment_deadline_confirmed"]
         if (keep["category"] in (None, "", DEFAULT_CATEGORY)) and merge["category"] not in (
             None,
             "",
@@ -755,23 +773,66 @@ def get_daily_application_counts(start_date: str = None) -> pd.DataFrame:
         conn.close()
 
 
-def get_conversion_stats() -> dict:
-    """投递 -> 面试 转化率：口径为「已产生至少一条面试记录的投递数 / 总投递数」。
+# ---------------------------------------------------------------------------
+# 笔试/测评截止时间
+# ---------------------------------------------------------------------------
+# 说明：投递 -> 面试 转化率的统计已从首页移除，转化情况改由「投递看板」的
+# 漏斗分析图逐层展示（口径更细，也不会被终止态覆盖掉进度），因此这里不再保留
+# get_conversion_stats。首页空出来的位置改放「近期笔试 Deadline」。
 
-    该口径不依赖 status 字段（因为状态一旦转为终止态会覆盖之前的进度信息），
-    只要曾经进入过面试环节（interviews 表中存在记录）即计入分子，更稳健。
+def set_assessment_deadline(
+    application_id: int, deadline_utc: str, confirmed: bool = True
+) -> None:
+    """写入某条投递的笔试/测评最晚提交时间（UTC ISO 字符串）。
+
+    confirmed=False 表示邮件里没写清时区，是按默认时区（北京时间）推算出来的，
+    展示时会标注"时区待确认"，提醒用户核对——截止时间算错一小时就可能错过提交。
     """
     conn = get_connection()
     try:
-        total = conn.execute("SELECT COUNT(*) AS c FROM applications;").fetchone()["c"]
-        with_interview = conn.execute(
-            "SELECT COUNT(DISTINCT application_id) AS c FROM interviews;"
-        ).fetchone()["c"]
-        rate = (with_interview / total) if total else 0.0
-        return {
-            "total_applications": total,
-            "applications_with_interview": with_interview,
-            "conversion_rate": rate,
-        }
+        conn.execute(
+            "UPDATE applications SET assessment_deadline_utc=?, assessment_deadline_confirmed=? WHERE id=?;",
+            (deadline_utc, int(confirmed), application_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_assessment_deadline(application_id: int) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            "UPDATE applications SET assessment_deadline_utc=NULL, assessment_deadline_confirmed=0 WHERE id=?;",
+            (application_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_upcoming_assessment_deadlines(include_expired: bool = False) -> pd.DataFrame:
+    """还没到期的笔试/测评截止时间，按截止时间升序（最紧急的排最前）。
+
+    include_expired=True 时连已经过期的一起返回（首页用它统计"错过了几个"）。
+    终止态（已拒绝/已终止）的投递不再需要做题，直接排除。
+    """
+    conn = get_connection()
+    try:
+        query = """
+            SELECT id, company, position, status, category,
+                   assessment_deadline_utc, assessment_deadline_confirmed
+            FROM applications
+            WHERE assessment_deadline_utc IS NOT NULL
+              AND assessment_deadline_utc != ''
+              AND status NOT IN ('已拒绝', '已终止')
+        """
+        params = []
+        if not include_expired:
+            # 存的都是 "+00:00" 结尾的 UTC ISO 串，格式一致时字符串比较等价于时间比较
+            query += " AND assessment_deadline_utc >= ?"
+            params.append(datetime.now(timezone.utc).isoformat())
+        query += " ORDER BY assessment_deadline_utc ASC;"
+        return pd.read_sql(query, conn, params=params)
     finally:
         conn.close()

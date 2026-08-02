@@ -6,19 +6,22 @@ ui_home.py
    地点/链接）。本地时间按侧边栏「时区设置」选定的时区换算，时间后面会标出
    当前是哪个时区，避免看错；timezone_confirmed=False 的记录单独分组标注
    "时间待确认"，不参与正常排序展示；无待办时显示空状态提示。
-2. 简单统计 —— 各状态数量、投递→面试转化率。
+2. 简单统计 —— 左边各状态数量，右边「近期笔试 Deadline」：把邮箱同步时解析出来的
+   笔试/测评最晚提交时间按公司、岗位列出来，越紧急的排越前面，不足 24 小时的会
+   单独提醒。（原来这里是「投递→面试转化率」，转化情况已改由「投递看板」的漏斗
+   分析图逐层展示，比单一比率更能看出卡在哪一环，就不在首页重复占位了。）
 3. 投递趋势折线图 —— X 轴为投递日期、Y 轴为当日投递数，支持切换统计周期
    （最近7/30/90天或全部），没有投递的日期补 0 使折线连续。
 """
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import altair as alt
 import pandas as pd
 import streamlit as st
 
 import db
-from timezone_utils import format_local, get_display_timezone_label
+from timezone_utils import format_local, get_display_timezone_label, parse_iso
 
 # 与 config.STATUS_COLOR 的分类色板同一套蓝色（slot 1），单一数据系列直接用它，
 # 不需要额外图例
@@ -67,10 +70,89 @@ def render_reminder_bar():
                 )
 
 
+def _remaining_text(deadline_utc: str) -> tuple[str, bool]:
+    """距离截止还剩多久的人话描述，以及是否紧急（不足 24 小时）。
+
+    用"还剩 N 天 / N 小时"而不是直接摆一个日期，是因为截止时间这种东西，
+    看到"还剩 6 小时"才会立刻去做，看到"08-07 11:53"很容易以为还早。
+    """
+    try:
+        left = parse_iso(deadline_utc) - datetime.now(timezone.utc)
+    except Exception:
+        return "", False
+    total_hours = left.total_seconds() / 3600
+    if total_hours < 0:
+        return "已截止", False
+    if total_hours < 1:
+        return f"仅剩 {max(int(left.total_seconds() // 60), 1)} 分钟", True
+    if total_hours < 24:
+        return f"仅剩 {int(total_hours)} 小时", True
+    return f"还剩 {int(total_hours // 24)} 天", False
+
+
+def render_assessment_deadlines():
+    """近期笔试 Deadline：公司 / 岗位 / 测评最晚提交时间。
+
+    数据来自邮箱同步时解析出的测评截止时间（applications.assessment_deadline_utc），
+    只展示还没到期的，按最紧急的排在最前。
+    """
+    st.markdown("**⏳ 近期笔试 Deadline**")
+    try:
+        upcoming = db.get_upcoming_assessment_deadlines()
+    except Exception as e:
+        st.error(f"加载笔试截止时间失败：{e}")
+        return
+
+    if upcoming.empty:
+        st.caption("目前没有待完成的笔试/测评～同步邮箱后，识别到的测评截止时间会出现在这里")
+        return
+
+    tz_label = get_display_timezone_label()
+    rows = []
+    urgent_count = 0
+    unconfirmed_count = 0
+    for row in upcoming.itertuples():
+        remaining, urgent = _remaining_text(row.assessment_deadline_utc)
+        urgent_count += int(urgent)
+        deadline_text = format_local(row.assessment_deadline_utc)
+        if not row.assessment_deadline_confirmed:
+            # 用一个记号而不是"（时区待确认）"五个字：这张表挤在首页右半边，
+            # 多几个字就会把「剩余」那一列挤出可视区域，含义放到下面的说明里讲
+            deadline_text += " ⚠️"
+            unconfirmed_count += 1
+        rows.append(
+            {
+                "公司": row.company,
+                "岗位": row.position,
+                "测评最晚提交时间": deadline_text,
+                "剩余": ("🔴 " if urgent else "") + remaining,
+            }
+        )
+
+    st.dataframe(
+        pd.DataFrame(rows),
+        width="stretch",
+        hide_index=True,
+        column_config={
+            "公司": st.column_config.TextColumn(width="small"),
+            "岗位": st.column_config.TextColumn(width="medium"),
+            "测评最晚提交时间": st.column_config.TextColumn(width="medium"),
+            "剩余": st.column_config.TextColumn(width="small"),
+        },
+    )
+    st.caption(f"时间按「{tz_label}」展示，越紧急的排越前面")
+    if unconfirmed_count:
+        st.caption("⚠️ = 邮件里没写清时区，已按北京时间推算，建议核对一下原邮件")
+    if urgent_count:
+        st.warning(f"有 {urgent_count} 个测评不到 24 小时就截止了，先把这几个做掉吧！", icon="⏰")
+
+
 def render_stats():
     st.subheader("📊 简单统计")
 
-    col1, col2 = st.columns(2)
+    # 右边的 Deadline 表有四列（公司/岗位/时间/剩余），对半分的话「剩余」那列
+    # 会被挤出可视区域，所以给它两倍宽；左边只是个状态计数表，窄一点够用
+    col1, col2 = st.columns([1, 2])
 
     with col1:
         st.markdown("**各状态数量**")
@@ -84,19 +166,7 @@ def render_stats():
             st.error(f"加载统计失败：{e}")
 
     with col2:
-        st.markdown("**投递 → 面试 转化率**")
-        try:
-            stats = db.get_conversion_stats()
-            rate_pct = f"{stats['conversion_rate'] * 100:.1f}%"
-            st.metric(
-                label="转化率（已进入面试环节 / 总投递数）",
-                value=rate_pct,
-                delta=f"{stats['applications_with_interview']} / {stats['total_applications']}",
-            )
-            if stats["total_applications"] > 0:
-                st.caption("每一份投递都是靠近offer的一步，慢慢来 💪")
-        except Exception as e:
-            st.error(f"加载统计失败：{e}")
+        render_assessment_deadlines()
 
 
 def render_trend_chart():

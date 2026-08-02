@@ -61,6 +61,10 @@ def _build_label(candidate: dict) -> str:
         local_time = format_local(candidate["start_time_utc"])
         confirmed_tag = "" if candidate.get("timezone_confirmed") else "（时区待确认）"
         parts.append(f"面试时间: {local_time} {confirmed_tag}")
+    if candidate.get("assessment_deadline_utc"):
+        deadline = format_local(candidate["assessment_deadline_utc"])
+        confirmed_tag = "" if candidate.get("assessment_deadline_confirmed") else "（时区待确认）"
+        parts.append(f"⏳ 测评最晚提交: {deadline} {confirmed_tag}")
     return " · ".join(parts)
 
 
@@ -189,7 +193,7 @@ def _find_in_batch_match(company: str, position: str, processed: list[dict]) -> 
 
 def _import_candidates(candidates: list[dict], actions: dict) -> None:
     """把用户勾选的候选写库：选了「同一条投递」的合并进已有记录，其余新建。"""
-    imported, merged, duplicated, passed = 0, 0, 0, 0
+    imported, merged, duplicated, passed, deadlines = 0, 0, 0, 0, 0
     details = []
     # 本次导入已经处理过的记录（新建的 + 合并进去的），用来拦住"同一条投递
     # 在一次同步里被登记两遍"
@@ -253,9 +257,31 @@ def _import_candidates(candidates: list[dict], actions: dict) -> None:
                 notes=c.get("notes", ""),
             )
 
+        # 笔试/测评截止时间写到投递记录上，首页「近期笔试 Deadline」直接读它。
+        # 合并进已有记录时也要写：一条投递先收到"已投递"确认、后收到测评通知，
+        # 截止时间就是靠这一步补上去的
+        if app_id and c.get("assessment_deadline_utc"):
+            existing = db.get_application(app_id) or {}
+            old_deadline = (existing.get("assessment_deadline_utc") or "").strip()
+            new_deadline = c["assessment_deadline_utc"]
+            # 已有更早的截止时间就别覆盖了（同一条投递可能有多封测评邮件，
+            # 以最紧的那个为准，宁可早提醒也不能把 deadline 往后推）
+            if not old_deadline or new_deadline < old_deadline:
+                db.set_assessment_deadline(
+                    app_id, new_deadline, confirmed=bool(c.get("assessment_deadline_confirmed"))
+                )
+                deadlines += 1
+                details.append(
+                    f"#{app_id}「{company}」记下了测评截止时间："
+                    f"{format_local(new_deadline)}"
+                    + ("" if c.get("assessment_deadline_confirmed") else "（时区待确认）")
+                )
+
     summary = f"导入完成啦：新增 {imported} 条"
     if merged:
         summary += f"，合并到已有记录 {merged} 条"
+    if deadlines:
+        summary += f"，记下 {deadlines} 个测评截止时间"
     if duplicated:
         summary += f"，重复的 {duplicated} 条没有再收一遍"
     if passed:

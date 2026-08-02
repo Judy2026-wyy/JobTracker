@@ -54,7 +54,21 @@ PARSE_SYSTEM_PROMPT = f"""你是求职邮件信息抽取助手。用户会给你
 - interview_timezone: 若邮件中明确提到时区（如"北京时间"、"美东时间"、"CST"等），
   给出对应的 IANA 时区名（如 Asia/Shanghai、America/New_York）；未提及则填 ""
 - location_or_link: 面试地点或会议链接，识别不到填 ""
+- has_assessment_deadline: true/false，邮件中是否给出了笔试/在线测评的**最晚提交（截止）时间**
+- assessment_deadline: 若 has_assessment_deadline 为 true，按 "YYYY-MM-DD HH:MM" 输出
+  邮件里写的截止时间原文（不要换算时区、不要自行推算）
+- assessment_deadline_timezone: 截止时间若明确标了时区，给出对应 IANA 时区名；未提及则填 ""
 - notes: 简短备注
+
+【笔试/测评截止时间的判定】
+只要邮件是让你在某个时间点之前完成笔试/在线测评/机考/测评问卷，就属于截止时间，
+常见说法包括："请于 X 前完成"、"完成截止时间为 X"、"测评链接有效期至 X"、
+"X 后链接失效"、"请在 48 小时内完成"（这种相对时间要结合邮件发送时间换算成具体时间点）。
+注意区分两种时间，不要混填：
+- 截止时间是"最晚什么时候之前做完"，填到 assessment_deadline；
+- 面试/笔试的**开始**时间是"几点准时开始"，填到 interview_datetime。
+一封邮件里两者可能同时出现（例如约定了考试窗口的开始与结束），各填各的；
+只给了做题时长（如"限时90分钟"）而没有截止日期的，不算截止时间，填 false。
 
 【岗位分类】
 分类只看岗位职能本身，不要受公司所属行业影响（例如银行招的后端工程师属于「后端开发」，
@@ -241,33 +255,57 @@ def parse_email_with_llm(mail: dict) -> dict | None:
         "interview_datetime_raw": (data.get("interview_datetime") or "").strip(),
         "interview_timezone": (data.get("interview_timezone") or "").strip(),
         "location_or_link": (data.get("location_or_link") or "").strip(),
+        "has_assessment_deadline": bool(data.get("has_assessment_deadline")),
+        "assessment_deadline_raw": (data.get("assessment_deadline") or "").strip(),
+        "assessment_deadline_timezone": (data.get("assessment_deadline_timezone") or "").strip(),
         "notes": (data.get("notes") or "").strip(),
         "source_subject": mail.get("subject", ""),
         "source_date": mail.get("date", ""),
     }
 
     # 换算面试时间为 UTC；若邮件未明确时区，标记为待确认
-    if result["has_interview_time"] and result["interview_datetime_raw"]:
-        tz_name = result["interview_timezone"] or DEFAULT_SOURCE_TIMEZONE
-        timezone_confirmed = bool(result["interview_timezone"])
-        try:
-            naive_dt = datetime.strptime(result["interview_datetime_raw"], "%Y-%m-%d %H:%M")
-            result["start_time_utc"] = to_utc_iso(naive_dt, source_tz_name=tz_name)
-            result["timezone_confirmed"] = timezone_confirmed
-        except ValueError:
-            result["start_time_utc"] = None
-            result["timezone_confirmed"] = False
-    else:
-        result["start_time_utc"] = None
-        result["timezone_confirmed"] = False
+    result["start_time_utc"], result["timezone_confirmed"] = _to_utc_or_none(
+        result["interview_datetime_raw"] if result["has_interview_time"] else "",
+        result["interview_timezone"],
+    )
+
+    # 笔试/测评截止时间同理：存 UTC，时区没写清就按北京时间推算并标记待确认
+    result["assessment_deadline_utc"], result["assessment_deadline_confirmed"] = _to_utc_or_none(
+        result["assessment_deadline_raw"] if result["has_assessment_deadline"] else "",
+        result["assessment_deadline_timezone"],
+    )
+    if not result["assessment_deadline_utc"]:
+        result["has_assessment_deadline"] = False
 
     # 邮件类型：供邮箱同步页面分组展示（笔试 / 面试 / offer通知 / 其他）
     result["email_type"] = classify_email_type(
         status=result["status"],
         has_interview_time=result["has_interview_time"],
+        has_assessment_deadline=result["has_assessment_deadline"],
     )
 
     return result
+
+
+def _to_utc_or_none(raw: str, tz_name: str) -> tuple[str | None, bool]:
+    """把邮件里的 "YYYY-MM-DD HH:MM" 原始时间换算成 UTC ISO。
+
+    返回 (utc_iso 或 None, 时区是否明确)。邮件没写时区时按
+    DEFAULT_SOURCE_TIMEZONE（北京时间）解释，并把第二个返回值置为 False，
+    让 UI 标注"时区待确认"提醒用户核对。原始时间格式不对时返回 (None, False)。
+    """
+    if not raw:
+        return None, False
+    source_tz = tz_name or DEFAULT_SOURCE_TIMEZONE
+    try:
+        naive_dt = datetime.strptime(raw, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None, False
+    try:
+        return to_utc_iso(naive_dt, source_tz_name=source_tz), bool(tz_name)
+    except Exception:
+        # 模型偶尔会编一个不存在的时区名，退回默认时区再算一次
+        return to_utc_iso(naive_dt, source_tz_name=DEFAULT_SOURCE_TIMEZONE), False
 
 
 def fetch_and_parse(days: int = 14, mailbox: str = "INBOX", limit: int = 50) -> list[dict]:

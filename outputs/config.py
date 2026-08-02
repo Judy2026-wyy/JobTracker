@@ -263,17 +263,31 @@ EMAIL_TYPES = [
 INTERVIEW_ROUND_STATUSES = ["一面", "二面", "三面", "HR面"]
 
 
-def classify_email_type(status: str = "", has_interview_time: bool = False) -> str:
+def classify_email_type(
+    status: str = "",
+    has_interview_time: bool = False,
+    has_assessment_deadline: bool = False,
+) -> str:
     """把解析出的投递状态归到邮箱同步页面展示用的邮件类型。
 
-    归类优先级：已收offer > 笔试 > 面试（含"邮件里带了具体面试时间"）> 其他。
+    归类优先级：已收offer > 面试轮次 > 笔试 > 带面试时间 > 其他。
+
+    两条与"笔试/测评截止时间"有关的规则：
+    - 带了截止时间、但没判出具体面试轮次的邮件一律算「笔试」——哪怕模型没给出
+      status，这类邮件本质就是让你去做题，归到笔试分组用户才找得到。
+    - 但如果 status 已经明确到某一轮面试（一面/二面/HR面…），仍按「面试」归类：
+      一封"约你一面，顺便做个性格测评"的邮件，主线是面试安排，丢进笔试分组
+      反而找不着。截止时间该记的照样记（那是另一条链路，见 email_import）。
+
     识别不出明确进度的求职邮件一律进"其他"。
     """
     if status == "已收offer":
         return EMAIL_TYPE_OFFER
-    if status == "笔试":
+    if status in INTERVIEW_ROUND_STATUSES:
+        return EMAIL_TYPE_INTERVIEW
+    if status == "笔试" or has_assessment_deadline:
         return EMAIL_TYPE_WRITTEN_TEST
-    if status in INTERVIEW_ROUND_STATUSES or has_interview_time:
+    if has_interview_time:
         return EMAIL_TYPE_INTERVIEW
     return EMAIL_TYPE_OTHER
 
